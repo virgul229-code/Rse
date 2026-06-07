@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="Suivi RSE"/>
+<title>Suivi RSE</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@700&display=swap" rel="stylesheet"/>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+  body{background:#0f0f0f;color:#fff;font-family:'DM Mono','Courier New',monospace;min-height:100vh;}
+  .app{display:flex;flex-direction:column;align-items:center;padding:24px 16px 60px;max-width:480px;margin:0 auto;}
+  .btn{border:none;cursor:pointer;border-radius:16px;font-family:inherit;font-size:15px;font-weight:500;padding:16px 10px;width:100%;transition:transform 0.1s,opacity 0.1s;-webkit-appearance:none;}
+  .btn:active{transform:scale(0.97);opacity:0.85;}
+  .pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:4px 12px;font-size:12px;}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px;width:100%;margin-bottom:10px;}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;width:100%;margin-bottom:16px;}
+  .grid5{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;width:100%;margin-bottom:12px;}
+  .card{background:#111;border:1px solid #1e1e1e;border-radius:16px;padding:16px;width:100%;margin-bottom:16px;}
+  .bar-wrap{width:100%;height:5px;background:#1e1e1e;border-radius:999px;overflow:hidden;}
+  .bar-fill{height:100%;border-radius:999px;transition:width 1s linear;}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+  @keyframes warn{0%,100%{opacity:1}50%{opacity:0.6}}
+  @keyframes slidein{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
+  .pulse{animation:pulse 1.5s infinite;}
+  .warn{animation:warn 2s infinite;}
+  .slidein{animation:slidein 0.3s ease;}
+  ::-webkit-scrollbar{display:none;}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <div style="color:#555;font-size:14px;padding:40px 0;">Chargement…</div>
+</div>
+
+<script>
+// ── Constantes RSE ────────────────────────────────────────────────────────
+const MIN_REST_MS    = 3*3600000;
+const MIN_REST2_MS   = 9*3600000;
+const MAX_REDUCED    = 3;
+const MAX_DRIVE_CONT = 4.5*3600000;
+const MAX_DRIVE_DAY  = 9*3600000;
+const MAX_DRIVE_DAY_EXT = 10*3600000;
+const MAX_DRIVE_WEEK = 56*3600000;
+const MAX_DRIVE_2WEEKS = 90*3600000;
+const MAX_WORK_NO_PAUSE = 6*3600000;
+const PAUSE_6H = 30*60000;
+const PAUSE_9H = 45*60000;
+const STORAGE_KEY = "suivi_rse_v1";
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+const fmt = (ms) => {
+  if(!ms||ms<0) return "00:00:00";
+  const s=Math.floor(ms/1000),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sc=s%60;
+  return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(sc).padStart(2,"0")}`;
+};
+const fmtHM = (ms) => {
+  if(!ms||ms<0) return "0h00";
+  const t=Math.floor(ms/60000);
+  return `${Math.floor(t/60)}h${String(t%60).padStart(2,"0")}`;
+};
+const fmtDT = (iso) => new Date(iso).toLocaleString("fr-FR",{day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit",second:"2-digit"});
+const weekStart = (date) => {
+  const d=new Date(date),day=d.getDay();
+  d.setDate(d.getDate()+(day===0?-6:1-day));d.setHours(0,0,0,0);return d;
+};
+const restType = (iso) => {
+  const d=new Date(iso),m=d.getHours()*60+d.getMinutes();
+  return (m>=540&&m<660)?"rest_reduced":"rest_normal";
+};
+const finalizeSession = (s,endIso) => {
+  const dur=new Date(endIso)-new Date(s.start);
+  const isR=s.type==="rest_reduced"||s.type==="rest_normal";
+  const req=isR&&dur<MIN_REST_MS;
+  return {...s,end:endIso,duration:dur,type:req?"pause":s.type,requalified:req};
+};
+const detectFractioned = (ds) => {
+  const r=ds.filter(s=>(s.type==="rest_reduced"||s.type==="rest_normal")&&s.duration);
+  return r.filter(s=>s.duration>=MIN_REST_MS&&s.duration<MIN_REST2_MS).length>0
+      && r.filter(s=>s.duration>=MIN_REST2_MS).length>0;
+};
+const countWeeklyRests = (sessions) => {
+  const ws=weekStart(new Date());
+  const byDay={};
+  sessions.filter(s=>new Date(s.start)>=ws).forEach(s=>{
+    const d=new Date(s.start).toDateString();
+    if(!byDay[d])byDay[d]=[];byDay[d].push(s);
+  });
+  let reduced=0,normal=0,fractioned=0;
+  Object.values(byDay).forEach(ds=>{
+    if(detectFractioned(ds)){fractioned++;return;}
+    ds.forEach(s=>{if(s.type==="rest_reduced")reduced++;if(s.type==="rest_normal")normal++;});
+  });
+  return{reduced,normal,fractioned};
+};
+const computeDriveStats = (sessions,cur,elapsed) => {
+  const today=new Date().toDateString(),ws=weekStart(new Date());
+  const pw=new Date(ws);pw.setDate(pw.getDate()-7);
+  let driveToday=0,driveWeek=0,drive2Weeks=0,contDrive=0,workToday=0,pauseToday=0;
+  sessions.forEach(s=>{
+    if(s.type==="drive"&&s.duration){
+      const st=new Date(s.start);
+      if(st.toDateString()===today)driveToday+=s.duration;
+      if(st>=ws)driveWeek+=s.duration;
+      if(st>=pw)drive2Weeks+=s.duration;
+    }
+  });
+  if(cur?.type==="drive"&&elapsed>0){driveToday+=elapsed;driveWeek+=elapsed;drive2Weeks+=elapsed;}
+  const allSorted=[...sessions].reverse();
+  let counting=true;
+  for(const s of allSorted){
+    if(!counting)break;
+    if(s.type==="drive")contDrive+=(s.duration||0);
+    else if(s.type==="pause"||s.type==="rest_reduced"||s.type==="rest_normal")counting=false;
+  }
+  if(cur?.type==="drive")contDrive+=elapsed;
+  if(cur?.type==="pause"||cur?.type==="rest_reduced"||cur?.type==="rest_normal")contDrive=0;
+  sessions.filter(s=>new Date(s.start).toDateString()===today&&(s.type==="work"||s.type==="drive")&&s.duration).forEach(s=>workToday+=s.duration);
+  if(cur&&(cur.type==="work"||cur.type==="drive"))workToday+=elapsed;
+  sessions.filter(s=>new Date(s.start).toDateString()===today&&s.type==="pause"&&s.duration).forEach(s=>pauseToday+=s.duration);
+  if(cur?.type==="pause")pauseToday+=elapsed;
+  return{driveToday,driveWeek,drive2Weeks,contDrive,workToday,pauseToday};
+};
+const getDailyWorkLimit = (sessions) => {
+  const today=new Date().toDateString();
+  const tw=sessions.filter(s=>new Date(s.start).toDateString()===today&&(s.type==="work"||s.type==="drive"));
+  const first=tw.length?new Date(tw[tw.length-1].start):new Date();
+  return(first.getHours()>=0&&first.getHours()<5)?10*3600000:12*3600000;
+};
+
+// ── State ─────────────────────────────────────────────────────────────────
+const C={
+  work:    {fg:"#4ade80",bg:"#0d1f0d",border:"#1e4d1e"},
+  drive:   {fg:"#34d399",bg:"#0a1f18",border:"#1a5040"},
+  pause:   {fg:"#fb923c",bg:"#1f130d",border:"#4d2e1e"},
+  rest_reduced:{fg:"#f59e0b",bg:"#1f1a0d",border:"#4d3e1e"},
+  rest_normal: {fg:"#60a5fa",bg:"#0d1525",border:"#1e3a5f"},
+  fractioned:  {fg:"#a78bfa",bg:"#150d25",border:"#3b2a5f"},
+};
+const RED={fg:"#ef4444",bg:"#2a0d0d",border:"#7f1d1d"};
+const ORA={fg:"#f97316",bg:"#2a1500",border:"#7c3500"};
+
+let state={
+  status:"idle",
+  sessions:[],
+  currentSession:null,
+  elapsed:0,
+  weeklyRests:{reduced:0,normal:0,fractioned:0},
+  lastRequalified:false,
+  historyDay:0,
+  historyExpanded:true,
+};
+let timerInterval=null;
+let requalNotifTimeout=null;
+
+// ── Persistence ───────────────────────────────────────────────────────────
+const load = () => {
+  try{
+    const raw=localStorage.getItem(STORAGE_KEY);
+    if(!raw)return{sessions:[],currentSession:null};
+    return JSON.parse(raw);
+  }catch{return{sessions:[],currentSession:null};}
+};
+const save = (sessions,currentSession) => {
+  try{localStorage.setItem(STORAGE_KEY,JSON.stringify({sessions,currentSession}));}catch(e){console.error(e);}
+};
+
+// ── Timer ─────────────────────────────────────────────────────────────────
+const startTimer = () => {
+  stopTimer();
+  timerInterval=setInterval(()=>{
+    if(!state.currentSession){stopTimer();return;}
+    state.elapsed=Date.now()-new Date(state.currentSession.start).getTime();
+    render();
+  },1000);
+};
+const stopTimer = () => {clearInterval(timerInterval);timerInterval=null;};
+
+// ── Actions ───────────────────────────────────────────────────────────────
+const switchTo = (newType) => {
+  const now=new Date().toISOString();
+  let updated=state.sessions,requalif=false;
+  if(state.currentSession){
+    const fin=finalizeSession(state.currentSession,now);
+    requalif=fin.requalified||false;
+    updated=[fin,...state.sessions];
+  }
+  const newSess={type:newType,start:now};
+  state.sessions=updated;state.currentSession=newSess;
+  state.status=newType;state.elapsed=0;
+  state.weeklyRests=countWeeklyRests(updated);
+  state.lastRequalified=requalif;
+  save(updated,newSess);
+  startTimer();
+  if(requalif){
+    clearTimeout(requalNotifTimeout);
+    requalNotifTimeout=setTimeout(()=>{state.lastRequalified=false;render();},5000);
+  }
+  render();
+};
+const startRest = () => switchTo(restType(new Date().toISOString()));
+const stopAll = () => {
+  const now=new Date().toISOString();
+  let updated=state.sessions,requalif=false;
+  if(state.currentSession){
+    const fin=finalizeSession(state.currentSession,now);
+    requalif=fin.requalified||false;
+    updated=[fin,...state.sessions];
+  }
+  state.sessions=updated;state.currentSession=null;
+  state.status="idle";state.elapsed=0;
+  state.weeklyRests=countWeeklyRests(updated);
+  state.lastRequalified=requalif;
+  save(updated,null);
+  stopTimer();
+  if(requalif){
+    clearTimeout(requalNotifTimeout);
+    requalNotifTimeout=setTimeout(()=>{state.lastRequalified=false;render();},5000);
+  }
+  render();
+};
+const clearAll = () => {
+  if(!confirm("Effacer tout l'historique ?"))return;
+  state.sessions=[];state.currentSession=null;state.status="idle";
+  state.elapsed=0;state.weeklyRests={reduced:0,normal:0,fractioned:0};
+  save([],null);stopTimer();render();
+};
+
+// ── Render helpers ────────────────────────────────────────────────────────
+const el=(tag,attrs={},children=[])=>{
+  const e=document.createElement(tag);
+  Object.entries(attrs).forEach(([k,v])=>{
+    if(k==="style"&&typeof v==="object")Object.assign(e.style,v);
+    else if(k.startsWith("on"))e.addEventListener(k.slice(2).toLowerCase(),v);
+    else if(k==="className")e.className=v;
+    else e.setAttribute(k,v);
+  });
+  children.forEach(c=>{
+    if(c===null||c===undefined)return;
+    e.appendChild(typeof c==="string"?document.createTextNode(c):c);
+  });
+  return e;
+};
+const div=(s={},ch=[])=>el("div",{style:s},ch);
+const span=(s={},ch=[])=>el("span",{style:s},ch);
+const btn=(s,ch,onClick)=>el("button",{className:"btn",style:s,onClick},ch);
+const pill=(s,ch)=>el("span",{className:"pill",style:s},ch);
+
+const dot=(color,anim)=>{
+  const d=span({width:"7px",height:"7px",borderRadius:"50%",background:color,display:"inline-block"});
+  if(anim)d.classList.add("pulse");
+  return d;
+};
+
+const barRow=(label,val,max,color)=>{
+  const pct=Math.min(val/max,1)*100;
+  return div({marginBottom:"9px"},[
+    div({display:"flex",justifyContent:"space-between",fontSize:"11px",marginBottom:"3px"},[
+      span({color:"#555"},[label]),
+      span({color},[fmtHM(val)])
+    ]),
+    div({},{...{},{className:"bar-wrap"}},[
+      (()=>{const b=div({height:"100%",borderRadius:"999px",width:pct+"%",background:color});b.className="bar-fill";return b;})()
+    ])
+  ]);
+};
+
+// hack: barRow with class
+const makeBarWrap=(label,val,max,color)=>{
+  const pct=Math.min((val||0)/(max||1),1)*100;
+  const wrap=document.createElement("div");wrap.style.marginBottom="9px";
+  const top=document.createElement("div");
+  Object.assign(top.style,{display:"flex",justifyContent:"space-between",fontSize:"11px",marginBottom:"3px"});
+  const lbl=document.createElement("span");lbl.style.color="#555";lbl.textContent=label;
+  const val2=document.createElement("span");val2.style.color=color;val2.textContent=fmtHM(val||0);
+  top.appendChild(lbl);top.appendChild(val2);
+  const bw=document.createElement("div");bw.className="bar-wrap";
+  const bf=document.createElement("div");bf.className="bar-fill";
+  bf.style.width=pct+"%";bf.style.background=color;
+  bw.appendChild(bf);wrap.appendChild(top);wrap.appendChild(bw);
+  return wrap;
+};
+
+const typeLabel=(s)=>{
+  if(s.requalified)return "PAUSE ↩ repos";
+  return{work:"TRAVAIL",drive:"CONDUITE",pause:"PAUSE",rest_reduced:"REPOS RÉDUIT",rest_normal:"REPOS NORMAL"}[s.type]||s.type;
+};
+
+// ── Main render ───────────────────────────────────────────────────────────
+const render = () => {
+  const app=document.getElementById("app");
+  app.innerHTML="";
+
+  const {status,sessions,currentSession,elapsed,weeklyRests,lastRequalified,historyDay,historyExpanded}=state;
+  const isResting=status==="rest_reduced"||status==="rest_normal";
+  const reducedOver=weeklyRests.reduced>=MAX_REDUCED;
+  const curRestType=restType(new Date().toISOString());
+  const restCol=curRestType==="rest_reduced"?(reducedOver?RED:C.rest_reduced):C.rest_normal;
+  const workLimit=getDailyWorkLimit(sessions);
+  const totals={work:0,drive:0,pause:0,rest_reduced:0,rest_normal:0};
+  const today=new Date().toDateString();
+  sessions.filter(s=>new Date(s.start).toDateString()===today&&s.duration).forEach(s=>{if(totals[s.type]!==undefined)totals[s.type]+=s.duration;});
+  if(currentSession&&elapsed>0&&totals[currentSession.type]!==undefined)totals[currentSession.type]+=elapsed;
+  const workDone=totals.work+totals.drive;
+  const workOverLimit=workDone>workLimit;
+  const restProgress=isResting?Math.min(elapsed/MIN_REST_MS,1):0;
+  const restValidated=isResting&&elapsed>=MIN_REST_MS;
+  const driveStats=computeDriveStats(sessions,currentSession,elapsed);
+
+  const getStatusLabel=()=>{
+    if(status==="work")return"En travail";if(status==="drive")return"En conduite";
+    if(status==="pause")return"En pause";
+    if(status==="rest_reduced")return restValidated?"Repos réduit ✓":"Repos réduit (< 3h)";
+    if(status==="rest_normal")return restValidated?"Repos normal ✓":"Repos normal (< 3h)";
+    return"Arrêté";
+  };
+  const timerColor=()=>{
+    if((status==="work"||status==="drive")&&workOverLimit)return RED.fg;
+    if(status==="drive"&&driveStats.contDrive>=MAX_DRIVE_CONT)return RED.fg;
+    if(isResting&&!restValidated)return"#888";
+    if(status==="idle")return"#333";
+    return C[status]?.fg||"#333";
+  };
+  const statusFg=status==="idle"?"#555":(isResting&&!restValidated?"#888":C[status]?.fg);
+
+  // ── Header
+  const header=document.createElement("div");
+  header.style.cssText="width:100%;margin-bottom:8px;";
+  const dateDiv=document.createElement("div");
+  dateDiv.style.cssText="font-size:11px;color:#555;letter-spacing:2px;text-transform:uppercase;margin-bottom:4px;";
+  dateDiv.textContent=new Date().toLocaleDateString("fr-FR",{weekday:"long",day:"numeric",month:"long"});
+  const titleDiv=document.createElement("div");
+  titleDiv.style.cssText="font-family:'Space Grotesk',sans-serif;font-size:26px;font-weight:700;letter-spacing:-1px;";
+  titleDiv.textContent="Suivi RSE";
+  header.appendChild(dateDiv);header.appendChild(titleDiv);app.appendChild(header);
+
+  // ── Notif requalification
+  if(lastRequalified){
+    const n=document.createElement("div");
+    n.className="slidein";
+    n.style.cssText=`width:100%;background:${C.pause.bg};border:1px solid ${C.pause.fg};border-radius:12px;padding:10px 14px;margin-top:10px;color:${C.pause.fg};font-size:12px;`;
+    n.innerHTML="↩ Repos &lt; 3h — requalifié en <strong>Pause</strong>";
+    app.appendChild(n);
+  }
+
+  // ── Status badges
+  const badges=document.createElement("div");
+  badges.style.cssText="width:100%;margin:14px 0 10px;display:flex;flex-wrap:wrap;gap:8px;";
+  const mainBadge=document.createElement("span");
+  mainBadge.className="pill";
+  mainBadge.style.cssText=`background:${status==="idle"?"#1a1a1a":C[status]?.bg};color:${statusFg};border:1px solid ${status==="idle"?"#333":(isResting&&!restValidated?"#444":C[status]?.fg)};`;
+  const dotEl=document.createElement("span");
+  dotEl.style.cssText=`width:7px;height:7px;border-radius:50%;background:${statusFg};display:inline-block;`;
+  if(status!=="idle")dotEl.classList.add("pulse");
+  mainBadge.appendChild(dotEl);mainBadge.appendChild(document.createTextNode(getStatusLabel()));
+  badges.appendChild(mainBadge);
+  if(reducedOver){const b=document.createElement("span");b.className="pill warn";b.style.cssText=`background:${RED.bg};color:${RED.fg};border:1px solid ${RED.border};`;b.textContent=`⚠ Repos réduit ${weeklyRests.reduced}/3`;badges.appendChild(b);}
+  if(driveStats.contDrive>=4*3600000){
+    const over=driveStats.contDrive>=MAX_DRIVE_CONT;
+    const b=document.createElement("span");b.className="pill warn";
+    b.style.cssText=`background:${over?RED.bg:ORA.bg};color:${over?RED.fg:ORA.fg};border:1px solid ${over?RED.border:ORA.border};`;
+    b.textContent=`🚛 Continue ${fmtHM(driveStats.contDrive)}`;badges.appendChild(b);
+  }
+  app.appendChild(badges);
+
+  // ── Alerte travail
+  if(workOverLimit){
+    const a=document.createElement("div");a.className="warn";
+    a.style.cssText=`width:100%;background:${RED.bg};border:1px solid ${RED.border};border-radius:12px;padding:10px 14px;margin-bottom:10px;color:${RED.fg};font-size:12px;`;
+    a.textContent=`⚠ Limite journalière dépassée (${workLimit/3600000}h max)`;app.appendChild(a);
+  }
+
+  // ── Alertes conduite RSE
+  const alerts=[];
+  if(driveStats.contDrive>=MAX_DRIVE_CONT)alerts.push({l:"red",m:`⛔ Conduite continue : ${fmtHM(driveStats.contDrive)} — PAUSE 45min OBLIGATOIRE`});
+  else if(driveStats.contDrive>=4*3600000)alerts.push({l:"orange",m:`⚠ Continue : ${fmtHM(driveStats.contDrive)} — pause dans ${fmtHM(MAX_DRIVE_CONT-driveStats.contDrive)}`});
+  if(driveStats.driveToday>=MAX_DRIVE_DAY_EXT)alerts.push({l:"red",m:`⛔ Conduite jour : ${fmtHM(driveStats.driveToday)} — LIMITE 10h`});
+  else if(driveStats.driveToday>=MAX_DRIVE_DAY)alerts.push({l:"orange",m:`⚠ Conduite jour : ${fmtHM(driveStats.driveToday)} — ext. 10h (2×/sem)`});
+  if(driveStats.driveWeek>=MAX_DRIVE_WEEK)alerts.push({l:"red",m:`⛔ Conduite semaine : ${fmtHM(driveStats.driveWeek)} — LIMITE 56h`});
+  if(driveStats.drive2Weeks>=MAX_DRIVE_2WEEKS)alerts.push({l:"red",m:`⛔ Conduite 2 sem : ${fmtHM(driveStats.drive2Weeks)} — LIMITE 90h`});
+  if(driveStats.workToday>=MAX_WORK_NO_PAUSE&&driveStats.pauseToday<PAUSE_6H)alerts.push({l:"orange",m:`⚠ Travail ${fmtHM(driveStats.workToday)} sans 30min de pause`});
+  if(driveStats.workToday>=9*3600000&&driveStats.pauseToday<PAUSE_9H)alerts.push({l:"orange",m:`⚠ Travail >9h : 45min de pause requises`});
+  if(alerts.length){
+    const wrap=document.createElement("div");wrap.style.cssText="width:100%;margin-bottom:12px;display:flex;flex-direction:column;gap:6px;";
+    alerts.forEach(a=>{
+      const d=document.createElement("div");d.className="warn";
+      d.style.cssText=`background:${a.l==="red"?RED.bg:ORA.bg};border:1px solid ${a.l==="red"?RED.border:ORA.border};border-radius:12px;padding:10px 14px;color:${a.l==="red"?RED.fg:ORA.fg};font-size:12px;`;
+      d.textContent=a.m;wrap.appendChild(d);
+    });
+    app.appendChild(wrap);
+  }
+
+  // ── Timer
+  const timerCard=document.createElement("div");
+  timerCard.style.cssText=`width:100%;background:#161616;border-radius:20px;padding:24px;margin-bottom:16px;border:1px solid ${status!=="idle"?(isResting&&!restValidated?"#333":C[status]?.border):"#222"};text-align:center;`;
+  const timerLabel=document.createElement("div");timerLabel.style.cssText="font-size:11px;color:#555;letter-spacing:2px;margin-bottom:8px;";timerLabel.textContent="SESSION EN COURS";
+  const timerVal=document.createElement("div");timerVal.style.cssText=`font-size:52px;font-weight:500;letter-spacing:2px;color:${timerColor()};`;timerVal.textContent=fmt(elapsed);
+  timerCard.appendChild(timerLabel);timerCard.appendChild(timerVal);
+  if(currentSession){const s=document.createElement("div");s.style.cssText="font-size:11px;color:#444;margin-top:8px;";s.textContent="Début : "+fmtDT(currentSession.start);timerCard.appendChild(s);}
+  if(status==="drive"){
+    const cont=driveStats.contDrive;
+    const d=document.createElement("div");d.style.cssText="margin-top:12px;font-size:11px;";
+    const col=cont>=MAX_DRIVE_CONT?RED.fg:cont>=4*3600000?ORA.fg:C.drive.fg;
+    d.innerHTML=`<span style="color:#555">Continue : </span><span style="color:${col}">${fmtHM(cont)}</span><span style="color:#333"> / 4h30</span>${cont<MAX_DRIVE_CONT?`<span style="color:#444"> — pause dans ${fmtHM(MAX_DRIVE_CONT-cont)}</span>`:""}`;
+    timerCard.appendChild(d);
+  }
+  if(isResting){
+    const d=document.createElement("div");d.style.marginTop="14px";
+    const lbl=document.createElement("div");lbl.style.cssText=`font-size:10px;color:${restValidated?C[status].fg:"#555"};letter-spacing:1px;margin-bottom:6px;`;
+    lbl.textContent=restValidated?"✓ REPOS VALIDÉ (3h+)":fmt(Math.max(MIN_REST_MS-elapsed,0))+" avant validation";
+    const bw=document.createElement("div");bw.className="bar-wrap";bw.style.height="6px";
+    const bf=document.createElement("div");bf.style.cssText=`height:100%;border-radius:999px;width:${restProgress*100}%;background:${restValidated?C[status].fg:"#555"};transition:width 1s linear;`;
+    bw.appendChild(bf);d.appendChild(lbl);d.appendChild(bw);timerCard.appendChild(d);
+  }
+  app.appendChild(timerCard);
+
+  // ── Boutons
+  const mkBtn=(label,type,color,borderColor,onClick)=>{
+    const b=document.createElement("button");b.className="btn";
+    b.style.cssText=`background:${color};color:${C[type]?.fg||"#fff"};border:2px solid ${borderColor};`;
+    b.textContent=label;b.onclick=onClick;return b;
+  };
+  const row1=document.createElement("div");row1.className="grid2";
+  const bWork=mkBtn(status==="work"?"✓ Travail":"▶ Travail","work",status==="work"?C.work.fg:C.work.bg,workOverLimit?RED.fg:C.work.fg,()=>switchTo("work"));
+  bWork.style.color=status==="work"?C.work.activeFg||"#0a1a0a":C.work.fg;
+  const bDrive=mkBtn(status==="drive"?"✓ Conduite":"🚛 Conduite","drive",status==="drive"?C.drive.fg:C.drive.bg,driveStats.contDrive>=MAX_DRIVE_CONT?RED.fg:C.drive.fg,()=>switchTo("drive"));
+  bDrive.style.color=status==="drive"?"#051510":C.drive.fg;
+  row1.appendChild(bWork);row1.appendChild(bDrive);app.appendChild(row1);
+
+  const row2=document.createElement("div");row2.className="grid2";
+  const bPause=mkBtn(status==="pause"?"✓ Pause":"⏸ Pause","pause",status==="pause"?C.pause.fg:C.pause.bg,C.pause.fg,()=>switchTo("pause"));
+  bPause.style.color=status==="pause"?"#1a0a00":C.pause.fg;
+  const bRest=document.createElement("button");bRest.className="btn";
+  const restActive=isResting;
+  bRest.style.cssText=`background:${restActive?restCol.fg:restCol.bg};color:${restActive?"#0a0a0a":restCol.fg};border:2px solid ${restCol.fg};display:flex;align-items:center;justify-content:center;flex-direction:column;gap:4px;padding:10px 6px;`;
+  bRest.innerHTML=`<span>${isResting?"✓":"🌙"} Repos</span><span style="font-size:9px;opacity:0.7">${curRestType==="rest_reduced"?`réduit ${weeklyRests.reduced}/3`:"normal"} · ≥3h</span>`;
+  bRest.onclick=startRest;
+  row2.appendChild(bPause);row2.appendChild(bRest);app.appendChild(row2);
+
+  const bStop=document.createElement("button");bStop.className="btn";
+  bStop.style.cssText=`width:100%;background:#1a1a1a;color:${status==="idle"?"#333":"#888"};border:1px solid #222;margin-bottom:20px;font-size:14px;padding:13px;cursor:${status==="idle"?"default":"pointer"};`;
+  bStop.textContent="■ Arrêter";bStop.disabled=status==="idle";bStop.onclick=stopAll;app.appendChild(bStop);
+
+  // ── Totaux
+  const tGrid=document.createElement("div");tGrid.className="grid3";
+  [{key:"work",label:"TRAVAIL",c:workOverLimit?RED:C.work},{key:"drive",label:"CONDUITE",c:driveStats.driveToday>=MAX_DRIVE_DAY?RED:C.drive},{key:"pause",label:"PAUSE",c:C.pause},{key:"rest_reduced",label:"REPOS RÉD.",c:reducedOver?RED:C.rest_reduced},{key:"rest_normal",label:"REPOS NOR.",c:C.rest_normal}]
+  .forEach(({key,label,c})=>{
+    const card=document.createElement("div");
+    card.style.cssText=`background:${c.bg||"#111"};border:1px solid ${c.border};border-radius:12px;padding:10px;`;
+    card.innerHTML=`<div style="font-size:8px;color:${c.fg};letter-spacing:1px;margin-bottom:3px;">${label}</div><div style="font-size:17px;color:${c.fg};">${fmt(totals[key])}</div>`;
+    tGrid.appendChild(card);
+  });
+  app.appendChild(tGrid);
+
+  // ── Résumé journée
+  const todaySess=sessions.filter(s=>new Date(s.start).toDateString()===today);
+  const isFrac=detectFractioned(todaySess);
+  const totalRest=totals.rest_reduced+totals.rest_normal;
+  const firstSess=todaySess.length?todaySess[todaySess.length-1]:null;
+  const amplitude=firstSess?(currentSession?Date.now():new Date(todaySess[0].end||Date.now()))-new Date(firstSess.start):0;
+
+  const dayCard=document.createElement("div");dayCard.className="card";
+  const dayTitle=document.createElement("div");dayTitle.style.cssText="font-size:10px;color:#444;letter-spacing:2px;margin-bottom:12px;";dayTitle.textContent="RÉSUMÉ DE LA JOURNÉE";dayCard.appendChild(dayTitle);
+  [
+    ["Travail + Conduite",workDone,workLimit,workOverLimit?RED.fg:C.work.fg],
+    ["Conduite seule",driveStats.driveToday,MAX_DRIVE_DAY,driveStats.driveToday>=MAX_DRIVE_DAY?RED.fg:C.drive.fg],
+    ["Continue sans pause",driveStats.contDrive,MAX_DRIVE_CONT,driveStats.contDrive>=MAX_DRIVE_CONT?RED.fg:driveStats.contDrive>=4*3600000?ORA.fg:C.drive.fg],
+    ["Pause",totals.pause,4*3600000,C.pause.fg],
+    ["Repos",totalRest,11*3600000,isFrac?C.fractioned.fg:C.rest_normal.fg],
+  ].forEach(([label,val,max,color])=>dayCard.appendChild(makeBarWrap(label,val,max,color)));
+
+  const dayGrid=document.createElement("div");dayGrid.style.cssText="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px;";
+  const restTypeStr=isFrac?"⟨ Fractionné":totalRest>=11*3600000?"Normal ✓":totalRest>=9*3600000?"Réduit ✓":totalRest>0?"En cours…":"Aucun";
+  const restTypeCol=isFrac?C.fractioned.fg:totalRest>=11*3600000?C.rest_normal.fg:totalRest>=9*3600000?C.rest_reduced.fg:"#555";
+  [{label:"AMPLITUDE",val:fmtHM(amplitude),col:"#888"},{label:"REPOS TYPE",val:restTypeStr,col:restTypeCol},{label:"COND. SEM.",val:fmtHM(driveStats.driveWeek)+"/56h",col:driveStats.driveWeek>=MAX_DRIVE_WEEK?RED.fg:C.drive.fg}]
+  .forEach(({label,val,col})=>{
+    const c=document.createElement("div");c.style.cssText="background:#161616;border-radius:10px;padding:8px 10px;";
+    c.innerHTML=`<div style="font-size:9px;color:#444;margin-bottom:2px;">${label}</div><div style="font-size:12px;color:${col};">${val}</div>`;
+    dayGrid.appendChild(c);
+  });
+  dayCard.appendChild(dayGrid);app.appendChild(dayCard);
+
+  // ── Conduite hebdo
+  const driveCard=document.createElement("div");driveCard.className="card";
+  const dTitle=document.createElement("div");dTitle.style.cssText="font-size:10px;color:#444;letter-spacing:2px;margin-bottom:12px;";dTitle.textContent="CONDUITE — LIMITES RSE";driveCard.appendChild(dTitle);
+  const dGrid=document.createElement("div");dGrid.style.cssText="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;";
+  [{label:"CETTE SEMAINE",val:driveStats.driveWeek,max:MAX_DRIVE_WEEK,unit:"56h max"},{label:"2 SEMAINES",val:driveStats.drive2Weeks,max:MAX_DRIVE_2WEEKS,unit:"90h max"}]
+  .forEach(({label,val,max,unit})=>{
+    const over=val>=max,warn2=val>=max*0.9;
+    const c=over?RED:warn2?ORA:C.drive;
+    const box=document.createElement("div");
+    box.style.cssText=`background:${c.bg||"#0a1f18"};border:1px solid ${c.border};border-radius:12px;padding:12px 10px;`;
+    box.innerHTML=`<div style="font-size:9px;color:${c.fg};letter-spacing:1px;margin-bottom:6px;">${label}</div><div style="font-size:22px;color:${c.fg};">${fmtHM(val)}</div><div style="font-size:9px;color:#444;margin-bottom:8px;">${unit}</div>`;
+    const bw=document.createElement("div");bw.className="bar-wrap";bw.style.marginBottom="6px";
+    const bf=document.createElement("div");bf.style.cssText=`height:100%;width:${Math.min(val/max,1)*100}%;background:${c.fg};border-radius:999px;`;
+    bw.appendChild(bf);box.appendChild(bw);
+    const left=document.createElement("div");left.style.cssText=`font-size:10px;color:${over?c.fg:"#555"};`;
+    left.textContent=over?"⛔ LIMITE":"Reste "+fmtHM(Math.max(max-val,0));box.appendChild(left);
+    dGrid.appendChild(box);
+  });
+  driveCard.appendChild(dGrid);
+  const pauseRules=document.createElement("div");
+  pauseRules.style.cssText="background:#161616;border-radius:10px;padding:10px 12px;font-size:11px;color:#444;line-height:1.9;";
+  pauseRules.innerHTML=`<div style="color:#555;font-size:10px;letter-spacing:1px;margin-bottom:6px;">PAUSES OBLIGATOIRES</div><div>🚛 Max <span style="color:${C.drive.fg}">4h30</span> de conduite continue</div><div>⏸ Puis <span style="color:${C.pause.fg}">45min</span> de pause (ou 15min + 30min)</div><div>🇫🇷 Max <span style="color:#888">6h</span> de travail sans 30min de pause</div><div>🇫🇷 Si >9h travail → <span style="color:#888">45min</span> de pause totale</div><div>📅 Max <span style="color:${C.drive.fg}">9h/jour</span> conduite (10h × 2/sem)</div>`;
+  driveCard.appendChild(pauseRules);app.appendChild(driveCard);
+
+  // ── Repos hebdo
+  const {reduced,normal,fractioned}=weeklyRests;
+  const reducedLeft=Math.max(MAX_REDUCED-reduced,0);
+  const ws=weekStart(new Date()),we=new Date(ws);we.setDate(we.getDate()+6);
+  const wLabel=`${ws.toLocaleDateString("fr-FR",{day:"numeric",month:"short"})} – ${we.toLocaleDateString("fr-FR",{day:"numeric",month:"short"})}`;
+  const restCard=document.createElement("div");restCard.className="card";
+  const rHeader=document.createElement("div");rHeader.style.cssText="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;";
+  rHeader.innerHTML=`<div style="font-size:10px;color:#444;letter-spacing:2px;">REPOS — SEMAINE</div><div style="font-size:10px;color:#333;">${wLabel}</div>`;
+  restCard.appendChild(rHeader);
+  const rGrid=document.createElement("div");rGrid.style.cssText="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;";
+  [{label:"RÉDUIT",count:reduced,max:MAX_REDUCED,col:reducedOver?RED:C.rest_reduced,sub:reducedOver?"⚠ MAX atteint":`${reducedLeft} restant${reducedLeft>1?"s":""}`},
+   {label:"NORMAL",count:normal,max:null,col:C.rest_normal,sub:"illimité"},
+   {label:"FRACTIONNÉ",count:fractioned,max:null,col:C.fractioned,sub:"3h + 9h"}]
+  .forEach(({label,count,max,col,sub})=>{
+    const box=document.createElement("div");
+    box.style.cssText=`background:${col.bg};border:1px solid ${col.border};border-radius:12px;padding:10px 8px;text-align:center;`;
+    box.innerHTML=`<div style="font-size:9px;color:${col.fg};letter-spacing:1px;margin-bottom:6px;">${label}</div><div style="font-size:26px;font-weight:500;color:${col.fg};line-height:1;">${count}</div>${max?`<div style="font-size:9px;color:#444;margin-top:4px;">/ ${max} max</div>`:`<div style="font-size:9px;color:#444;margin-top:4px;">cette sem.</div>`}`;
+    const dots=document.createElement("div");dots.style.cssText="display:flex;justify-content:center;gap:4px;margin-top:6px;";
+    const n=max||Math.max(count,1);
+    for(let i=0;i<n;i++){const d=document.createElement("div");d.style.cssText=`width:8px;height:8px;border-radius:50%;background:${i<count?col.fg:"#222"};`;dots.appendChild(d);}
+    box.appendChild(dots);
+    const subEl=document.createElement("div");subEl.style.cssText=`font-size:9px;color:${reducedOver&&label==="RÉDUIT"?RED.fg:"#555"};margin-top:6px;`;subEl.textContent=sub;box.appendChild(subEl);
+    rGrid.appendChild(box);
+  });
+  restCard.appendChild(rGrid);
+  const fracInfo=document.createElement("div");fracInfo.style.cssText="margin-top:10px;padding:8px 10px;background:#161616;border-radius:10px;font-size:10px;color:#444;line-height:1.6;";
+  fracInfo.textContent="⟨⟩ Fractionné RSE = 1 repos ≥3h + 1 repos ≥9h · sans quota réduit";
+  restCard.appendChild(fracInfo);app.appendChild(restCard);
+
+  // ── Historique 21 jours
+  const days=Array.from({length:21},(_,i)=>{const d=new Date();d.setDate(d.getDate()-i);d.setHours(0,0,0,0);return d;});
+  const daysWithData=new Set(sessions.map(s=>new Date(s.start).toDateString()));
+  const histCard=document.createElement("div");histCard.style.cssText="width:100%;margin-bottom:16px;";
+  const histHeader=document.createElement("div");histHeader.style.cssText="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;";
+  const histToggle=document.createElement("button");histToggle.style.cssText="background:none;border:none;color:#555;cursor:pointer;font-size:11px;letter-spacing:2px;font-family:inherit;display:flex;align-items:center;gap:6px;padding:0;";
+  histToggle.textContent=`HISTORIQUE 21 JOURS ${historyExpanded?"▲":"▼"}`;
+  histToggle.onclick=()=>{state.historyExpanded=!state.historyExpanded;render();};
+  const clearBtn=document.createElement("button");clearBtn.style.cssText="background:none;border:none;color:#2a2a2a;cursor:pointer;font-size:11px;font-family:inherit;";clearBtn.textContent="Effacer tout";clearBtn.onclick=clearAll;
+  histHeader.appendChild(histToggle);if(sessions.length>0)histHeader.appendChild(clearBtn);histCard.appendChild(histHeader);
+
+  if(historyExpanded){
+    const scroll=document.createElement("div");scroll.style.cssText="width:100%;overflow-x:auto;padding-bottom:8px;margin-bottom:12px;";
+    const pills=document.createElement("div");pills.style.cssText="display:flex;gap:6px;width:max-content;";
+    days.forEach((d,i)=>{
+      const hasData=daysWithData.has(d.toDateString()),active=historyDay===i;
+      const label=i===0?"Aujourd'hui":i===1?"Hier":d.toLocaleDateString("fr-FR",{weekday:"short",day:"numeric",month:"short"});
+      const p=document.createElement("button");
+      p.style.cssText=`background:${active?"#fff":"#161616"};color:${active?"#000":hasData?"#aaa":"#333"};border:1px solid ${active?"#fff":hasData?"#333":"#1e1e1e"};border-radius:10px;padding:6px 12px;cursor:pointer;font-size:11px;font-family:inherit;white-space:nowrap;position:relative;`;
+      p.textContent=label;
+      p.onclick=()=>{state.historyDay=i;render();};
+      if(hasData&&!active){const dot=document.createElement("span");dot.style.cssText="position:absolute;top:3px;right:3px;width:4px;height:4px;border-radius:50%;background:#4ade80;";p.appendChild(dot);}
+      pills.appendChild(p);
+    });
+    scroll.appendChild(pills);histCard.appendChild(scroll);
+
+    const selDate=days[historyDay];
+    const daySess=sessions.filter(s=>new Date(s.start).toDateString()===selDate.toDateString());
+    const dayFrac=detectFractioned(daySess);
+    const dayTotals={work:0,drive:0,pause:0,rest_reduced:0,rest_normal:0};
+    daySess.forEach(s=>{if(s.duration&&dayTotals[s.type]!==undefined)dayTotals[s.type]+=s.duration;});
+
+    if(daySess.length>0){
+      if(dayFrac){const f=document.createElement("div");f.style.cssText=`background:${C.fractioned.bg};border:1px solid ${C.fractioned.border};border-radius:10px;padding:8px 12px;margin-bottom:10px;font-size:11px;color:${C.fractioned.fg};`;f.textContent="⟨⟩ Repos fractionné (3h + 9h)";histCard.appendChild(f);}
+      const sumGrid=document.createElement("div");sumGrid.className="grid5";
+      [{key:"work",label:"Trav.",color:C.work.fg},{key:"drive",label:"Cond.",color:C.drive.fg},{key:"pause",label:"Pause",color:C.pause.fg},{key:"rest_reduced",label:"R.Réd.",color:C.rest_reduced.fg},{key:"rest_normal",label:"R.Nor.",color:dayFrac?C.fractioned.fg:C.rest_normal.fg}]
+      .forEach(({key,label,color})=>{
+        const box=document.createElement("div");box.style.cssText="background:#161616;border-radius:10px;padding:8px 4px;text-align:center;";
+        box.innerHTML=`<div style="font-size:9px;color:#444;margin-bottom:3px;">${label}</div><div style="font-size:12px;color:${dayTotals[key]>0?color:"#2a2a2a"};">${fmtHM(dayTotals[key])}</div>`;
+        sumGrid.appendChild(box);
+      });
+      histCard.appendChild(sumGrid);
+    }
+
+    if(daySess.length===0){
+      const empty=document.createElement("div");empty.style.cssText="color:#2a2a2a;font-size:13px;text-align:center;padding:20px 0;";empty.textContent="Aucune session ce jour";histCard.appendChild(empty);
+    } else {
+      const list=document.createElement("div");list.style.cssText="display:flex;flex-direction:column;gap:8px;";
+      daySess.forEach(s=>{
+        const c=s.requalified?C.pause:(C[s.type]||C.work);
+        const row=document.createElement("div");
+        row.style.cssText=`background:#141414;border:1px solid ${c.border};border-radius:12px;padding:12px 14px;display:grid;grid-template-columns:1fr auto;gap:8px;`;
+        const left=document.createElement("div");
+        const badge=document.createElement("span");badge.style.cssText=`display:inline-flex;align-items:center;border-radius:999px;padding:3px 10px;font-size:10px;background:${c.bg};color:${c.fg};margin-bottom:6px;`;badge.textContent=typeLabel(s);
+        const start=document.createElement("div");start.style.cssText="font-size:11px;color:#444;margin-top:4px;";start.textContent=fmtDT(s.start);
+        left.appendChild(badge);left.appendChild(start);
+        if(s.end){const end=document.createElement("div");end.style.cssText="font-size:11px;color:#333;";end.textContent="→ "+fmtDT(s.end);left.appendChild(end);}
+        const right=document.createElement("div");right.style.cssText=`text-align:right;color:${c.fg};font-size:15px;align-self:center;`;right.textContent=s.duration?fmt(s.duration):"—";
+        row.appendChild(left);row.appendChild(right);list.appendChild(row);
+      });
+      histCard.appendChild(list);
+    }
+  }
+  app.appendChild(histCard);
+
+  // ── Règles RSE
+  const rulesCard=document.createElement("div");rulesCard.className="card";
+  rulesCard.innerHTML=`<div style="font-size:10px;color:#444;letter-spacing:2px;margin-bottom:8px;">RÈGLES RSE EN VIGUEUR</div><div style="font-size:11px;color:#444;line-height:1.9;"><div>🚛 Conduite max : <span style="color:#555">4h30</span> continue → 45min pause</div><div>📅 Conduite/jour : <span style="color:#555">9h</span> (10h × 2/sem)</div><div>📆 Conduite/sem : <span style="color:#555">56h</span> · 2 sem : 90h</div><div>🇫🇷 Travail : max <span style="color:#555">6h</span> sans pause · 30min (6-9h) · 45min (+9h)</div><div>🌙 Repos valide si ≥ <span style="color:#555">3h</span> sans interruption</div><div>🟡 Repos réduit : <span style="color:#555">9h</span> min · max 3×/semaine</div><div>🔵 Repos normal : <span style="color:#555">11h</span> min</div><div>⟨⟩ Repos fractionné : <span style="color:#555">3h + 9h</span> = repos normal</div></div>`;
+  app.appendChild(rulesCard);
+};
+
+// ── Init ──────────────────────────────────────────────────────────────────
+window.onload = () => {
+  const data=load();
+  state.sessions=data.sessions||[];
+  state.weeklyRests=countWeeklyRests(state.sessions);
+  if(data.currentSession){
+    state.currentSession=data.currentSession;
+    state.status=data.currentSession.type;
+    state.elapsed=Date.now()-new Date(data.currentSession.start).getTime();
+    startTimer();
+  }
+  render();
+};
+</script>
+</body>
+</html>
